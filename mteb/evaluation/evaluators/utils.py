@@ -11,6 +11,99 @@ from packaging.version import Version
 from sklearn.metrics import auc
 
 
+def ed_calc(x, attention_mask):
+    """
+    Calculate the energy for all queries in parallel, accounting for padding.
+
+    Args:
+	x (torch.Tensor): Query embeddings of shape [num_queries, max_sequence_length, query_dim].
+        attention_mask (torch.Tensor): Mask of shape [num_queries, max_sequence_length],
+                                        where 1 indicates valid tokens and 0 indicates padding.
+
+    Returns:
+	torch.Tensor: Energy values for each query, shape [num_queries].
+    """
+    # Shape: [num_queries, max_sequence_length, query_dim]
+    num_queries, max_sequence_length, query_dim = x.shape
+
+    # Create pairwise differences: [num_queries, max_sequence_length, max_sequence_length, query_dim]
+    x_expanded_1 = x.unsqueeze(2)  # Expand along the second dimension
+    x_expanded_2 = x.unsqueeze(1)  # Expand along the third dimension
+    pairwise_diff = x_expanded_1 - x_expanded_2
+
+    # Compute pairwise distances: [num_queries, max_sequence_length, max_sequence_length]
+    pairwise_distances = torch.norm(pairwise_diff, dim=3)
+
+    # Apply the attention mask to exclude padded tokens
+    attention_mask_expanded = attention_mask.unsqueeze(2) & attention_mask.unsqueeze(1)  # [num_queries, max_sequence_length, max_sequence_length]
+    pairwise_distances = pairwise_distances * attention_mask_expanded  # Mask padded positions
+
+    # Count valid token pairs for normalization
+    valid_pairs = attention_mask_expanded.sum(dim=(1, 2)).clamp(min=1)  # Shape: [num_queries]
+
+    # Sum of distances and normalize
+    ed_sums = pairwise_distances.sum(dim=(1, 2))  # Sum across all pairs
+    energy = ed_sums / valid_pairs  # Normalize by the number of valid pairs
+    #print("ed_calc_new result:", energy)
+    return energy  # Shape: [num_queries]
+
+def energy_distance(x, y, attention_mask):
+    """
+    Compute energy distance between multivector queries and single vector documents using torch.einsum.
+
+    Args:
+        x (torch.Tensor): Query embeddings of shape [num_queries, max_sequence_length, query_dim].
+        y (torch.Tensor): Document embeddings of shape [num_docs, doc_dim].
+        attention_mask (torch.Tensor): Attention mask of shape [num_queries, max_sequence_length].
+
+    Returns:
+        torch.Tensor: Energy distances of shape [num_queries, num_docs].
+    """
+    # Shapes
+    num_queries, max_sequence_length, query_dim = x.shape
+    num_docs, doc_dim = y.shape
+
+    # Ensure dimensions are compatible
+    assert query_dim == doc_dim, "Query and document dimensions must match!"
+
+    # Step 1: Compute squared norms of the document embeddings (efficient norm calculation)
+    # y: [num_docs, query_dim], norm_y: [num_docs]
+    norm_y = torch.einsum("nd,nd->n", y, y)  # Shape: [num_docs]
+
+    # Step 2: Compute pairwise squared distances between query tokens and document embeddings
+    # x: [num_queries, max_sequence_length, query_dim], y: [num_docs, query_dim]
+    # Output shape: [num_queries, max_sequence_length, num_docs]
+    dot_product = torch.einsum("qld,nd->qln", x, y)  # Shape: [num_queries, max_sequence_length, num_docs]
+
+    # Squared distance calculation
+    # norm_x_tokens: [num_queries, max_sequence_length]
+    norm_x_tokens = torch.einsum("qld,qld->ql", x, x)  # Shape: [num_queries, max_sequence_length]
+    
+    # Applying the squared distance formula: ||x_i - y_j||^2 = ||x_i||^2 + ||y_j||^2 - 2 * <x_i, y_j>
+    squared_distances = (
+        norm_x_tokens.unsqueeze(2) + norm_y.unsqueeze(0).unsqueeze(1) - 2 * dot_product
+    )  # Shape: [num_queries, max_sequence_length, num_docs]
+
+    # Ensure distances are non-negative due to numerical instability
+    squared_distances = squared_distances.clamp(min=0)
+
+    # Step 3: Compute Euclidean distances (L2 norm)
+    distances = torch.sqrt(squared_distances)  # Shape: [num_queries, max_sequence_length, num_docs]
+
+    # Step 4: Apply attention mask to the distances
+    attention_mask_expanded = attention_mask.unsqueeze(2)  # Shape: [num_queries, max_sequence_length, 1]
+    masked_distances = distances * attention_mask_expanded  # Shape: [num_queries, max_sequence_length, num_docs]
+
+    # Step 5: Aggregate distances across sequence length and normalize by valid token count
+    valid_token_counts = attention_mask.sum(dim=1).clamp(min=1).unsqueeze(1)  # Shape: [num_queries, 1]
+    ed_sums = masked_distances.sum(dim=1) / valid_token_counts  # Shape: [num_queries, num_docs]
+
+    # Step 6: Compute energy for queries and combine with pairwise distances
+    ed_queries = ed_calc(x, attention_mask)  # Precomputed energy for each query, shape: [num_queries]
+    energy_distances = (2 * ed_sums - ed_queries.unsqueeze(1)) * -1  # Shape: [num_queries, num_docs]
+
+    return energy_distances
+
 def cos_sim(a, b):
     """Computes the cosine similarity cos_sim(a[i], b[j]) for all i and j.
 
