@@ -22,6 +22,8 @@ from .utils import (
     confidence_scores,
     convert_conv_history_to_query,
     cos_sim,
+    energy_calc,
+    energy_distance,
     download,
     hole,
     mrr,
@@ -95,6 +97,19 @@ class DenseRetrievalExactSearch:
             # custom functions can be used by extending the DenseRetrievalExactSearch class
             self.predict = self.model.predict
 
+    def precompute_corpus_embeddings(self, corpus, model, batch_size, chunk_size):
+        all_corpus_embeddings = []
+        print("Length of corpus:", len(corpus))
+        print("Batch size:", batch_size)
+        for start_idx in range(0, len(corpus), chunk_size):
+            end_idx = min(start_idx + chunk_size, len(corpus))
+            print("Chunk to document:", end_idx)
+            chunk = corpus[start_idx:end_idx]
+            embeddings = model.encode_corpus(chunk, batch_size=batch_size, convert_to_tensor=True)
+            embeddings = embeddings.to('cpu')
+            all_corpus_embeddings.append(embeddings)
+        return all_corpus_embeddings
+
     def search(
         self,
         corpus: dict[str, dict[str, str]],
@@ -120,8 +135,9 @@ class DenseRetrievalExactSearch:
                 **self.encode_kwargs,
             )
         else:
-            query_embeddings = self.model.encode(
+            query_embeddings, attention_masks = self.model.encode(
                 queries,  # type: ignore
+                output_value="token_embeddings",
                 task_name=task_name,
                 prompt_type=PromptType.query,
                 **self.encode_kwargs,
@@ -135,83 +151,105 @@ class DenseRetrievalExactSearch:
         corpus = [corpus[cid] for cid in corpus_ids]  # type: ignore
 
         logger.info("Encoding Corpus in batches... Warning: This might take a while!")
+        # Precompute all corpus embeddings
+        all_corpus_embeddings = self.precompute_corpus_embeddings(
+            corpus=corpus,
+            model=self.model,  # Use the corpus-specific model
+            batch_size=self.batch_size,
+            chunk_size=self.corpus_chunk_size
+        )
 
         itr = range(0, len(corpus), self.corpus_chunk_size)
 
         result_heaps = {
             qid: [] for qid in query_ids
         }  # Keep only the top-k docs for each query
-        for batch_num, corpus_start_idx in enumerate(itr):
-            logger.info(f"Encoding Batch {batch_num + 1}/{len(itr)}...")
-            corpus_end_idx = min(corpus_start_idx + self.corpus_chunk_size, len(corpus))
 
-            # Encode chunk of corpus
-            if (
-                self.save_corpus_embeddings
-                and request_qid
-                and len(self.corpus_embeddings[request_qid])
-            ):
-                sub_corpus_embeddings = torch.tensor(
-                    self.corpus_embeddings[request_qid][batch_num]
-                )
-            else:
+        for query_batch_index, query_batch in enumerate(query_embeddings):
+            for chunk_idx, sub_corpus_embeddings in enumerate(all_corpus_embeddings):
+            #for batch_num, corpus_start_idx in enumerate(itr):
+                logger.info(f"Encoding Batch {batch_num + 1}/{len(itr)}...")
+                #corpus_end_idx = min(corpus_start_idx + self.corpus_chunk_size, len(corpus))
+                sub_corpus_embeddings = sub_corpus_embeddings.to('cuda')
+                chunk_start_idx = chunk_idx * self.corpus_chunk_size  # Calculate the starting index of this chunk
+
+                
                 # Encode chunk of corpus
-                sub_corpus_embeddings = self.model.encode(
-                    corpus[corpus_start_idx:corpus_end_idx],  # type: ignore
-                    task_name=task_name,
-                    prompt_type=PromptType.passage,
-                    request_qid=request_qid,
-                    **self.encode_kwargs,
+                #if (
+                #    self.save_corpus_embeddings
+                #    and request_qid
+                #    and len(self.corpus_embeddings[request_qid])
+                #):
+                #    sub_corpus_embeddings = torch.tensor(
+                #        self.corpus_embeddings[request_qid][batch_num]
+                #    )
+                #else:
+                    # Encode chunk of corpus
+                #    sub_corpus_embeddings = self.model.encode(
+                #        corpus[corpus_start_idx:corpus_end_idx],  # type: ignore
+                #        task_name=task_name,
+                #        prompt_type=PromptType.passage,
+                #        request_qid=request_qid,
+                #        **self.encode_kwargs,
+                #    )
+                #    if self.save_corpus_embeddings and request_qid:
+                #        self.corpus_embeddings[request_qid].append(sub_corpus_embeddings)
+    
+                # Compute similarites using self defined similarity otherwise default to cosine-similarity
+                #if hasattr(self.model, "similarity"):
+                #    similarity_scores = self.model.similarity(
+                #        query_embeddings, sub_corpus_embeddings
+                #    )
+                #else:
+                similarity_scores = energy_distance(query_embeddings, sub_corpus_embeddings, attention_masks[query_batch_index])
+                is_nan = torch.isnan(similarity_scores)
+                if is_nan.sum() > 0:
+                    logger.warning(
+                        f"Found {is_nan.sum()} NaN values in the similarity scores. Replacing NaN values with -inf."
+                    )
+                similarity_scores[is_nan] = float('inf') * -1
+    
+                # Get top-k values
+                similarity_scores_top_k_values, similarity_scores_top_k_idx = torch.topk(
+                    similarity_scores,
+                    min(
+                        top_k + 1,
+                        len(similarity_scores[1])
+                        if len(similarity_scores) > 1
+                        else len(similarity_scores[-1]),
+                    ),
+                    dim=1,
+                    largest=True,
+                    sorted=return_sorted,
                 )
-                if self.save_corpus_embeddings and request_qid:
-                    self.corpus_embeddings[request_qid].append(sub_corpus_embeddings)
-
-            # Compute similarites using self defined similarity otherwise default to cosine-similarity
-            if hasattr(self.model, "similarity"):
-                similarity_scores = self.model.similarity(
-                    query_embeddings, sub_corpus_embeddings
+                similarity_scores_top_k_values = (
+                    similarity_scores_top_k_values.cpu().tolist()
                 )
-            else:
-                similarity_scores = cos_sim(query_embeddings, sub_corpus_embeddings)
-            is_nan = torch.isnan(similarity_scores)
-            if is_nan.sum() > 0:
-                logger.warning(
-                    f"Found {is_nan.sum()} NaN values in the similarity scores. Replacing NaN values with -1."
-                )
-            similarity_scores[is_nan] = -1
+                similarity_scores_top_k_idx = similarity_scores_top_k_idx.cpu().tolist()
+    
+                for query_itr in range(len(query_batch)):
+                    global_query_index = query_itr + (query_batch_index * self.batch_size)
+                    #query_id = query_ids[query_itr]
+                    query_id = query_ids[global_query_index]
+                    for sub_corpus_id, score in zip(
+                        similarity_scores_top_k_idx[query_itr],
+                        similarity_scores_top_k_values[query_itr],
+                    ):
+                        #corpus_id = corpus_ids[corpus_start_idx + sub_corpus_id]
+                        corpus_id = corpus_ids[chunk_start_idx + sub_corpus_id]  # Use chunk_start_idx here
+                        if len(result_heaps[query_id]) < top_k:
+                            # Push item on the heap
+                            heapq.heappush(result_heaps[query_id], (score, corpus_id))
+                        else:
+                            # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
+                            heapq.heappushpop(result_heaps[query_id], (score, corpus_id))
 
-            # Get top-k values
-            similarity_scores_top_k_values, similarity_scores_top_k_idx = torch.topk(
-                similarity_scores,
-                min(
-                    top_k + 1,
-                    len(similarity_scores[1])
-                    if len(similarity_scores) > 1
-                    else len(similarity_scores[-1]),
-                ),
-                dim=1,
-                largest=True,
-                sorted=return_sorted,
-            )
-            similarity_scores_top_k_values = (
-                similarity_scores_top_k_values.cpu().tolist()
-            )
-            similarity_scores_top_k_idx = similarity_scores_top_k_idx.cpu().tolist()
+                sub_corpus_embeddings = sub_corpus_embeddings.to('cpu') #Move corpus chunk back to cpu because it will be reused
 
-            for query_itr in range(len(query_embeddings)):
-                query_id = query_ids[query_itr]
-                for sub_corpus_id, score in zip(
-                    similarity_scores_top_k_idx[query_itr],
-                    similarity_scores_top_k_values[query_itr],
-                ):
-                    corpus_id = corpus_ids[corpus_start_idx + sub_corpus_id]
-                    if len(result_heaps[query_id]) < top_k:
-                        # Push item on the heap
-                        heapq.heappush(result_heaps[query_id], (score, corpus_id))
-                    else:
-                        # If item is larger than the smallest in the heap, push it on the heap then pop the smallest element
-                        heapq.heappushpop(result_heaps[query_id], (score, corpus_id))
-
+            # After processing the batch, delete the query_batch tensor to free GPU memory
+            del query_batch
+            torch.cuda.empty_cache()  # Optionally free up any cached GPU memory
+        
         for qid in result_heaps:
             for score, corpus_id in result_heaps[qid]:
                 self.results[qid][corpus_id] = score
@@ -351,7 +389,7 @@ class DenseRetrievalExactSearch:
         )
         queries = self.convert_conv_history_to_query(model, conversations)  # type: ignore
         return model.encode(
-            queries, task_name=task_name, prompt_type=PromptType.query, **kwargs
+            queries, output_value="token_embeddings", task_name=task_name, prompt_type=PromptType.query, **kwargs
         )  # type: ignore
 
     @staticmethod
@@ -421,7 +459,7 @@ class DRESModel:
                 sentences, task_name, prompt_type=prompt_type, **kwargs
             )
         return self.model.encode(
-            sentences, task_name=task_name, prompt_type=prompt_type, **kwargs
+            sentences, output_value="token_embeddings", task_name=task_name, prompt_type=prompt_type, **kwargs
         )
 
 
