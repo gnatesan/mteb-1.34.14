@@ -22,7 +22,7 @@ from .utils import (
     confidence_scores,
     convert_conv_history_to_query,
     cos_sim,
-    energy_calc,
+    ed_calc,
     energy_distance,
     download,
     hole,
