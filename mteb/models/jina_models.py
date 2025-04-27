@@ -16,7 +16,11 @@ from mteb.models.sentence_transformer_wrapper import SentenceTransformerWrapper
 logger = logging.getLogger(__name__)
 
 MIN_SENTENCE_TRANSFORMERS_VERSION = (3, 1, 0)
-CURRENT_SENTENCE_TRANSFORMERS_VERSION = tuple(map(int, st_version.split(".")))
+#CURRENT_SENTENCE_TRANSFORMERS_VERSION = tuple(map(int, st_version.split(".")))
+CURRENT_SENTENCE_TRANSFORMERS_VERSION = tuple(
+    int(part) for part in st_version.split(".") if part.isdigit()
+)
+
 
 XLMR_LANGUAGES = [
     "afr_Latn",

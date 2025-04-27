@@ -97,7 +97,7 @@ class DenseRetrievalExactSearch:
             # custom functions can be used by extending the DenseRetrievalExactSearch class
             self.predict = self.model.predict
 
-    def precompute_corpus_embeddings(self, corpus, model, batch_size, chunk_size):
+    def precompute_corpus_embeddings(self, corpus, model, task_name, prompt_type, request_qid, batch_size, chunk_size):
         all_corpus_embeddings = []
         print("Length of corpus:", len(corpus))
         print("Batch size:", batch_size)
@@ -105,7 +105,9 @@ class DenseRetrievalExactSearch:
             end_idx = min(start_idx + chunk_size, len(corpus))
             print("Chunk to document:", end_idx)
             chunk = corpus[start_idx:end_idx]
-            embeddings = model.encode_corpus(chunk, batch_size=batch_size, convert_to_tensor=True)
+            embeddings = model.encode_corpus(chunk, task_name=task_name, prompt_type=prompt_type, request_qid=request_qid, batch_size=batch_size, convert_to_tensor=True)  
+            if not torch.is_tensor(embeddings):
+                embeddings = torch.tensor(embeddings)
             embeddings = embeddings.to('cpu')
             all_corpus_embeddings.append(embeddings)
         return all_corpus_embeddings
@@ -135,12 +137,16 @@ class DenseRetrievalExactSearch:
                 **self.encode_kwargs,
             )
         else:
+            #print("Encode kwargs", self.encode_kwargs)
+            kwargs2 = dict(self.encode_kwargs)  # Make a safe copy
+            kwargs2.pop("output_value", None)   # Remove output_value if it exists
             query_embeddings, attention_masks = self.model.encode(
                 queries,  # type: ignore
                 output_value="token_embeddings",
                 task_name=task_name,
                 prompt_type=PromptType.query,
-                **self.encode_kwargs,
+                **kwargs2,
+                #**self.encode_kwargs,
             )
 
         logger.info("Sorting Corpus by document length (Longest first)...")
@@ -155,6 +161,9 @@ class DenseRetrievalExactSearch:
         all_corpus_embeddings = self.precompute_corpus_embeddings(
             corpus=corpus,
             model=self.model,  # Use the corpus-specific model
+            task_name=task_name,
+            prompt_type=PromptType.passage, 
+            request_qid=request_qid,
             batch_size=self.batch_size,
             chunk_size=self.corpus_chunk_size
         )
@@ -168,7 +177,7 @@ class DenseRetrievalExactSearch:
         for query_batch_index, query_batch in enumerate(query_embeddings):
             for chunk_idx, sub_corpus_embeddings in enumerate(all_corpus_embeddings):
             #for batch_num, corpus_start_idx in enumerate(itr):
-                logger.info(f"Encoding Batch {batch_num + 1}/{len(itr)}...")
+                logger.info(f"Encoding Batch {chunk_idx + 1}/{len(all_corpus_embeddings)}...")
                 #corpus_end_idx = min(corpus_start_idx + self.corpus_chunk_size, len(corpus))
                 sub_corpus_embeddings = sub_corpus_embeddings.to('cuda')
                 chunk_start_idx = chunk_idx * self.corpus_chunk_size  # Calculate the starting index of this chunk
@@ -201,7 +210,7 @@ class DenseRetrievalExactSearch:
                 #        query_embeddings, sub_corpus_embeddings
                 #    )
                 #else:
-                similarity_scores = energy_distance(query_embeddings, sub_corpus_embeddings, attention_masks[query_batch_index])
+                similarity_scores = energy_distance(query_batch, sub_corpus_embeddings, attention_masks[query_batch_index])
                 is_nan = torch.isnan(similarity_scores)
                 if is_nan.sum() > 0:
                     logger.warning(
@@ -435,6 +444,7 @@ class DRESModel:
             return self.corpus_embeddings[request_qid]
 
         sentences = corpus_to_str(corpus)
+        print("Encode corpus kwargs", kwargs)
         corpus_embeddings = self.model.encode(
             sentences,
             task_name=task_name,
@@ -455,11 +465,13 @@ class DRESModel:
         **kwargs,
     ):
         if prompt_type and prompt_type == PromptType.passage:
+            print("Encode corpus kwargs", kwargs)
             return self.encode_corpus(
                 sentences, task_name, prompt_type=prompt_type, **kwargs
             )
+        #print("Encode kwargs", kwargs)
         return self.model.encode(
-            sentences, output_value="token_embeddings", task_name=task_name, prompt_type=prompt_type, **kwargs
+            sentences, task_name=task_name, prompt_type=prompt_type, **kwargs
         )
 
 

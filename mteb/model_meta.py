@@ -38,7 +38,7 @@ FRAMEWORKS = Literal[
     "PyLate",
     "ColBERT",
 ]
-DISTANCE_METRICS = Literal["cosine", "max_sim", "dot"]
+DISTANCE_METRICS = Literal["cosine", "max_sim", "dot", "energy_distance"]
 
 
 def sentence_transformers_loader(
